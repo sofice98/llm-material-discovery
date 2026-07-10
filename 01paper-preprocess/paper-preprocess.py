@@ -12,11 +12,10 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
+from datetime import datetime
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PAPER_DIR = "01paper-preprocess/paper"
-DEFAULT_OUTPUT_FILE = "01paper-preprocess/paper.json"
 DEFAULT_CONCURRENCY = 50
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_MAX_RETRIES = 2
@@ -357,8 +356,9 @@ def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     config = load_config()
     concurrency = get_int_env("PAPER_CONCURRENCY", DEFAULT_CONCURRENCY)
-    paper_dir = resolve_project_path(DEFAULT_PAPER_DIR)
-    output_path = resolve_project_path(DEFAULT_OUTPUT_FILE)
+    paper_dir = resolve_project_path("01paper-preprocess/paper")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = resolve_project_path(f"01paper-preprocess/paper_{timestamp}.json")
     timeout = DEFAULT_TIMEOUT_SECONDS
     retries = DEFAULT_MAX_RETRIES
 
