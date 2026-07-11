@@ -14,4 +14,4 @@ __pycache__/
 *.pdf
 .vscode
 
-01paper-preprocess/*.json
+01_paper_preprocess/*.json
