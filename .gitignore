@@ -14,4 +14,5 @@ __pycache__/
 *.pdf
 .vscode
 
-01_paper_preprocess/*.json
+01_paper_preprocess/output/
+02_get_train_data/output/
