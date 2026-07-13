@@ -16,7 +16,7 @@ llm-material-discovery/
 │  ├─ output/                 # 训练数据及工具默认输出目录
 │  ├─ get_train_data.py       # 训练数据生成脚本
 │  └─ jsonl_tools.py          # JSONL 工具
-├─ llm_client/                 # 统一的 Chat Completions 请求客户端
+├─ llm_client/                 # 统一的 Responses API 请求客户端
 ├─ .env.example
 └─ requirements.txt
 ```
@@ -32,14 +32,15 @@ pip install -r requirements.txt
 | 变量 | 说明 |
 | --- | --- |
 | `API_KEY` | 大模型 API 密钥 |
-| `CHAT_COMPLETIONS_URL` | Chat Completions API 地址，默认 MiniMax `/v1/chat/completions` |
+| `MODEL_URL` | Responses API 地址，默认 MiniMax `/v1/responses` |
 | `MODEL` | 模型名称 |
 | `MODEL_CONCURRENCY` | 并发数，默认 `50` |
+| `PDF_PAGES_PER_REQUEST` | 第一步每次模型请求最多包含的 PDF 页数，默认 `10` |
 | `MODEL_TIMEOUT_SECONDS` | 模型请求超时秒数，默认 `600` |
 | `MODEL_MAX_RETRIES` | 模型请求失败重试次数，默认 `2` |
 | `TRANSLATE_MAX_OUTPUT_TOKENS` | 翻译单次最大输出 token，默认 `32768` |
 
-旧 `.env` 中的 `RESPONSES_URL` 若以 `/responses` 结尾，会自动转换为对应的 `/chat/completions` 地址；建议后续改用 `CHAT_COMPLETIONS_URL`。
+旧的 Chat Completions 地址（以 `/chat/completions` 结尾）会自动转换为对应的 `/responses` 地址；建议使用 `MODEL_URL`。
 
 ## 01_paper_preprocess
 
@@ -55,6 +56,7 @@ python 01_paper_preprocess/paper_preprocess.py
 | --- | --- | --- | --- |
 | `--paper-dir PATH` | 否 | `01_paper_preprocess/paper` | PDF 输入目录，递归查找 `.pdf` |
 | `--output-dir PATH` | 否 | `01_paper_preprocess/output` | JSON 输出目录 |
+| `--pages-per-request N` | 否 | `PDF_PAGES_PER_REQUEST` 或 `10` | 按页切分 PDF，每批独立请求并作为一篇文献写入输出数组 |
 
 ## 02_get_train_data
 
@@ -70,7 +72,7 @@ python 02_get_train_data/get_train_data.py --method SFT --input 01_paper_preproc
 | --- | --- | --- | --- |
 | `--method {CPT,SFT,DPO}` | 是 | - | 训练数据格式和提示词目录 |
 | `--input PATH` | 否 | 最新的 `paper_*.json` | 输入论文 JSON |
-| `--output-dir PATH` | 否 | `02_get_train_data/output` | JSONL 和错误报告输出目录 |
+| `--output-dir PATH` | 否 | `02_get_train_data/output` | JSONL 输出目录；错误信息直接输出到控制台 |
 
 ### `jsonl_tools.py translate`
 

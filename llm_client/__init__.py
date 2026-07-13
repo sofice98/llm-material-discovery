@@ -1,5 +1,5 @@
-"""Shared client for calls to the configured chat-completions provider."""
+"""Shared client for calls to the configured Responses API provider."""
 
-from .chat_client import ChatCompletionClient, LLMClientError, create_client
+from .chat_client import LLMClientError, ResponsesClient, create_client
 
-__all__ = ["ChatCompletionClient", "LLMClientError", "create_client"]
+__all__ = ["LLMClientError", "ResponsesClient", "create_client"]

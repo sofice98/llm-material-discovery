@@ -9,7 +9,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from tqdm import tqdm
 from datetime import datetime
@@ -19,13 +19,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from llm_client import ChatCompletionClient, LLMClientError, create_client
+from llm_client import LLMClientError, ResponsesClient, create_client
 
 
 DEFAULT_PAPER_DIR = "01_paper_preprocess/paper"
 DEFAULT_OUTPUT_DIR = "01_paper_preprocess/output"
 DEFAULT_CONCURRENCY = 50
 DEFAULT_PDF_RENDER_DPI = 300
+DEFAULT_PAGES_PER_REQUEST = 10
 IMAGE_MIME_TYPE = "image/png"
 IMAGE_FORMAT = "png"
 
@@ -55,6 +56,15 @@ def parse_args() -> argparse.Namespace:
             f"resolved from the project root (default: {DEFAULT_OUTPUT_DIR})."
         ),
     )
+    parser.add_argument(
+        "--pages-per-request",
+        type=int,
+        default=None,
+        help=(
+            "Maximum PDF pages sent in one model request. Defaults to "
+            f"PDF_PAGES_PER_REQUEST or {DEFAULT_PAGES_PER_REQUEST}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -79,9 +89,9 @@ def get_int_env(name: str, default: int) -> int:
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise ConfigError(f"{name} must be an integer, got: {raw_value}") from exc
+        raise ValueError(f"{name} must be an integer, got: {raw_value}") from exc
     if value < 1:
-        raise ConfigError(f"{name} must be greater than or equal to 1, got: {value}")
+        raise ValueError(f"{name} must be greater than or equal to 1, got: {value}")
     return value
 
 
@@ -93,9 +103,10 @@ def find_pdf_files(paper_dir: Path) -> list[Path]:
     return sorted(path for path in paper_dir.rglob("*.pdf") if path.is_file())
 
 
-def render_pdf_as_image_parts(
+def iter_pdf_image_batches(
     path: Path,
-) -> list[dict[str, Any]]:
+    pages_per_request: int,
+) -> Iterator[tuple[int, int, int, list[dict[str, Any]]]]:
     try:
         import fitz
     except ImportError as exc:
@@ -105,43 +116,56 @@ def render_pdf_as_image_parts(
 
     zoom = DEFAULT_PDF_RENDER_DPI / 72.0
     matrix = fitz.Matrix(zoom, zoom)
-    image_parts: list[dict[str, Any]] = []
-
     with fitz.open(path) as document:
         if document.page_count < 1:
             raise RuntimeError(f"PDF has no pages: {path}")
 
-        for page_index in range(document.page_count):
-            page = document.load_page(page_index)
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            image_bytes = pixmap.tobytes(IMAGE_FORMAT)
-            encoded = base64.b64encode(image_bytes).decode("ascii")
-            image_parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{IMAGE_MIME_TYPE};base64,{encoded}"},
-                }
-            )
-
-    return image_parts
+        batch_count = (document.page_count + pages_per_request - 1) // pages_per_request
+        for batch_index, start_index in enumerate(
+            range(0, document.page_count, pages_per_request)
+        ):
+            end_index = min(start_index + pages_per_request, document.page_count)
+            image_parts: list[dict[str, Any]] = []
+            for page_index in range(start_index, end_index):
+                page = document.load_page(page_index)
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                image_bytes = pixmap.tobytes(IMAGE_FORMAT)
+                encoded = base64.b64encode(image_bytes).decode("ascii")
+                image_parts.append(
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{IMAGE_MIME_TYPE};base64,{encoded}",
+                    }
+                )
+            yield batch_index + 1, batch_count, start_index + 1, image_parts
 
 
 def request_extraction(
     image_parts: list[dict[str, Any]],
-    client: ChatCompletionClient,
+    client: ResponsesClient,
+    batch_index: int,
+    batch_count: int,
+    start_page: int,
 ) -> str:
-    return client.complete(
+    end_page = start_page + len(image_parts) - 1
+    batch_note = (
+        f"这是由一个 PDF 切分出的第 {batch_index}/{batch_count} 份，包含原 PDF "
+        f"第 {start_page}-{end_page} 页。请将本次提供的页面独立视为一篇文献进行提取，"
+        "只使用当前页面中明确出现的信息，不要补全其他分页中的内容。"
+    )
+    return client.respond(
         [
             {
                 "role": "user",
                 "content": [
                     *image_parts,
-                    {"type": "text", "text": EXTRACTION_PROMPT},
+                    {"type": "input_text", "text": batch_note},
+                    {"type": "input_text", "text": EXTRACTION_PROMPT},
                 ],
             },
         ],
-        max_completion_tokens=524288,
-        thinking_type="adaptive",
+        max_output_tokens=524288,
+        reasoning_effort="high",
     )
 
 
@@ -172,24 +196,45 @@ def parse_json_from_text(text: str) -> Any:
 
 def process_pdf(
     path: Path,
-    client: ChatCompletionClient,
+    client: ResponsesClient,
+    pages_per_request: int,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "success",
-        "data": None,
+        "data": [],
+        "errors": [],
     }
 
     try:
-        image_parts = render_pdf_as_image_parts(path)
-        response_text = request_extraction(image_parts, client)
-        extracted = parse_json_from_text(response_text)
-        if not isinstance(extracted, dict):
-            raise RuntimeError("Model returned JSON, but the top-level value is not an object.")
-        result["data"] = extracted
+        for batch_index, batch_count, start_page, image_parts in iter_pdf_image_batches(
+            path, pages_per_request
+        ):
+            try:
+                response_text = request_extraction(
+                    image_parts,
+                    client,
+                    batch_index,
+                    batch_count,
+                    start_page,
+                )
+                extracted = parse_json_from_text(response_text)
+                if not isinstance(extracted, dict):
+                    raise RuntimeError(
+                        "Model returned JSON, but the top-level value is not an object."
+                    )
+                result["data"].append(extracted)
+            except Exception as exc:
+                result["errors"].append(
+                    f"part {batch_index}/{batch_count} (page {start_page}-"
+                    f"{start_page + len(image_parts) - 1}): {exc}"
+                )
+
+        if result["errors"]:
+            result["status"] = "partial" if result["data"] else "failed"
         return result
     except Exception as exc:
         result["status"] = "failed"
-        result["error"] = str(exc)
+        result["errors"].append(str(exc))
         return result
 
 
@@ -203,6 +248,15 @@ def main() -> int:
     args = parse_args()
     client = create_client()
     concurrency = get_int_env("MODEL_CONCURRENCY", DEFAULT_CONCURRENCY)
+    pages_per_request = (
+        args.pages_per_request
+        if args.pages_per_request is not None
+        else get_int_env("PDF_PAGES_PER_REQUEST", DEFAULT_PAGES_PER_REQUEST)
+    )
+    if pages_per_request < 1:
+        raise ValueError(
+            f"--pages-per-request must be greater than or equal to 1, got: {pages_per_request}"
+        )
     dpi = DEFAULT_PDF_RENDER_DPI
     paper_dir = resolve_project_path(args.paper_dir)
     output_dir = resolve_project_path(args.output_dir)
@@ -214,6 +268,7 @@ def main() -> int:
     print(f"Model: {client.model}")
     print(
         f"Concurrency: {concurrency}; render DPI: {dpi}; "
+        f"pages per request: {pages_per_request}"
     )
 
     pdf_files = find_pdf_files(paper_dir)
@@ -228,13 +283,14 @@ def main() -> int:
 
     print(f"Found {len(pdf_files)} PDF file(s).")
     print("Converting PDF pages in memory and parsing PDFs...")
-    results_by_path: dict[Path, dict[str, Any]] = {}
+    results_by_path: dict[Path, list[dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
                 process_pdf,
                 path,
-                client
+                client,
+                pages_per_request,
             ): path
             for path in pdf_files
         }
@@ -248,21 +304,34 @@ def main() -> int:
             result = future.result()
             status = result.get("status", "unknown")
             relative_path = format_path(path)
+            data = result.get("data")
+            if isinstance(data, list) and data:
+                results_by_path[path] = data
             if status == "success":
-                tqdm.write(f"[success] {relative_path}")
-                data = result.get("data")
-                if isinstance(data, dict):
-                    results_by_path[path] = data
+                tqdm.write(f"[success] {relative_path}: {len(data)} part(s)")
+            elif status == "partial":
+                tqdm.write(
+                    f"[partial] {relative_path}: {len(data)} part(s) succeeded; "
+                    + "; ".join(result.get("errors", []))
+                )
             else:
-                tqdm.write(f"[failed] {relative_path}: {result.get('error', 'unknown error')}")
+                errors = result.get("errors", [])
+                tqdm.write(
+                    f"[failed] {relative_path}: "
+                    + ("; ".join(errors) if errors else "unknown error")
+                )
 
-    results = [results_by_path[path] for path in pdf_files if path in results_by_path]
+    results = [
+        paper
+        for path in pdf_files
+        for paper in results_by_path.get(path, [])
+    ]
     write_output(output_path, results)
-    failed_count = len(pdf_files) - len(results)
+    failed_count = len(pdf_files) - len(results_by_path)
     elapsed = time.perf_counter() - started_at
     print("Extraction finished.")
-    print(f"Parsed successfully: {len(results)}")
-    print(f"Failed: {failed_count}")
+    print(f"Extracted document parts: {len(results)}")
+    print(f"PDFs with no successful parts: {failed_count}")
     print(f"Output file: {format_path(output_path)}")
     print(f"Elapsed time: {elapsed:.1f}s")
     return 0

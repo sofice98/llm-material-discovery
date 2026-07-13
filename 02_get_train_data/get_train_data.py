@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from llm_client import ChatCompletionClient, LLMClientError, create_client
+from llm_client import LLMClientError, ResponsesClient, create_client
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory for timestamped JSONL and error-report files.",
+        help="Directory for timestamped JSONL output files.",
     )
     return parser.parse_args()
 
@@ -183,7 +183,7 @@ def request_samples(
     method: str,
     task_type: str,
     config: dict[str, Any],
-    client: ChatCompletionClient,
+    client: ResponsesClient,
 ) -> list[dict[str, Any]]:
     paper_json = json.dumps(paper, ensure_ascii=False, separators=(",", ":"))
     format_hint = {
@@ -204,10 +204,10 @@ def request_samples(
         f"5. 数组元素格式必须为：{format_hint}\n\n"
         f"文献 JSON：\n{paper_json}"
     )
-    response_text = client.complete(
+    response_text = client.respond(
         [{"role": "user", "content": user_text}],
-        max_completion_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-        thinking_type="adaptive",
+        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort="high",
     )
     parsed = parse_json_from_text(response_text)
     if isinstance(parsed, dict):
@@ -249,7 +249,7 @@ def process_job(
     prompt: str,
     method: str,
     config: dict[str, Any],
-    client: ChatCompletionClient,
+    client: ResponsesClient,
 ) -> dict[str, Any]:
     task_type = TASKS[prompt_name]
     try:
@@ -298,7 +298,6 @@ def main() -> int:
     prompts = load_prompts(args.method)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"train_{args.method.lower()}_{timestamp}.jsonl"
-    error_path = output_dir / f"train_{args.method.lower()}_{timestamp}_errors.json"
 
     print(f"Method: {args.method}")
     print(f"Input file: {display_path(input_path)}")
@@ -332,7 +331,13 @@ def main() -> int:
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Generating", unit="call"
         ):
-            results.append(future.result())
+            result = future.result()
+            results.append(result)
+            if "error" in result:
+                tqdm.write(
+                    f"[failed] Paper {result['paper_index'] + 1}, "
+                    f"task {result['task']}: {result['error']}"
+                )
 
     results.sort(key=lambda item: (item["paper_index"], item["task"]))
     merged: list[dict[str, str]] = []
@@ -351,16 +356,10 @@ def main() -> int:
                 merged.append(sample)
 
     written_count = write_jsonl(output_path, merged)
-    if errors:
-        error_path.write_text(
-            json.dumps(errors, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
 
     elapsed = time.perf_counter() - started_at
     print(f"Invalid/oversized samples discarded: {discarded}")
     print(f"Failed API calls: {len(errors)}")
-    if errors:
-        print(f"Error report: {display_path(error_path)}")
     print(f"Elapsed time: {elapsed:.1f}s")
     print(f"Final output samples: {written_count}")
     return 0 if not errors else 1

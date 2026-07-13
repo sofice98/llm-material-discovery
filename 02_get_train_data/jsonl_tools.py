@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from llm_client import ChatCompletionClient, create_client
+from llm_client import ResponsesClient, create_client
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -229,7 +229,7 @@ def translate_batch(
     batch: list[dict[str, Any]],
     language: str,
     config: dict[str, Any],
-    client: ChatCompletionClient,
+    client: ResponsesClient,
 ) -> dict[int, dict[str, str]]:
     source_json = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
     prompt = (
@@ -239,10 +239,10 @@ def translate_batch(
         "exactly the same shape and item ids; do not add Markdown or explanations.\n\n"
         f"Source JSON:\n{source_json}"
     )
-    response_text = client.complete(
+    response_text = client.respond(
         [{"role": "user", "content": prompt}],
-        max_completion_tokens=config["max_output_tokens"],
-        thinking_type="none",
+        max_output_tokens=config["max_output_tokens"],
+        reasoning_effort="none",
     )
     parsed = parse_json_response(response_text)
     if not isinstance(parsed, list):
