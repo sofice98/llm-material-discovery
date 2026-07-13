@@ -40,13 +40,11 @@ class ResponsesClient:
         self,
         input_data: str | list[dict[str, Any]],
         *,
-        max_output_tokens: int,
-        reasoning_effort: str = "none",
+        reasoning_effort: str,
     ) -> str:
         body: dict[str, Any] = {
             "model": self.model,
             "input": input_data,
-            "max_output_tokens": max_output_tokens,
         }
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}

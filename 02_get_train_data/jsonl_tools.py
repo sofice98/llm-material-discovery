@@ -192,7 +192,6 @@ def parse_json_response(text: str) -> Any:
 def load_model_config() -> dict[str, Any]:
     config: dict[str, Any] = {
         "concurrency": int(os.getenv("MODEL_CONCURRENCY", "10")),
-        "max_output_tokens": int(os.getenv("TRANSLATE_MAX_OUTPUT_TOKENS", "32768")),
     }
     return config
 
@@ -241,7 +240,6 @@ def translate_batch(
     )
     response_text = client.respond(
         [{"role": "user", "content": prompt}],
-        max_output_tokens=config["max_output_tokens"],
         reasoning_effort="none",
     )
     parsed = parse_json_response(response_text)

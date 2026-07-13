@@ -32,21 +32,24 @@ pip install -r requirements.txt
 | 变量 | 说明 |
 | --- | --- |
 | `API_KEY` | 大模型 API 密钥 |
-| `MODEL_URL` | Responses API 地址，默认 MiniMax `/v1/responses` |
+| `MODEL_URL` | Responses API 地址，例如 `https://apinebula.com/v1/responses` |
 | `MODEL` | 模型名称 |
 | `MODEL_CONCURRENCY` | 并发数，默认 `50` |
-| `PDF_PAGES_PER_REQUEST` | 第一步每次模型请求最多包含的 PDF 页数，默认 `10` |
+| `PDF_IMAGES_PER_REQUEST` | 每次模型请求最多包含的 PDF 页面图片数量，默认 `10` |
+| `PDF_IMAGE_MAX_MB` | 单张渲染后的 PDF 页面图片最大大小（MB），默认 `10`；超出时不上传也不请求模型 |
 | `MODEL_TIMEOUT_SECONDS` | 模型请求超时秒数，默认 `600` |
 | `MODEL_MAX_RETRIES` | 模型请求失败重试次数，默认 `2` |
-| `TRANSLATE_MAX_OUTPUT_TOKENS` | 翻译单次最大输出 token，默认 `32768` |
-
-旧的 Chat Completions 地址（以 `/chat/completions` 结尾）会自动转换为对应的 `/responses` 地址；建议使用 `MODEL_URL`。
+| `QINIU_ACCESS_KEY` | 七牛云 AccessKey |
+| `QINIU_SECRET_KEY` | 七牛云 SecretKey |
+| `QINIU_BUCKET` | 七牛云对象存储空间名称 |
+| `QINIU_PUBLIC_DOMAIN` | 七牛云空间的公网域名（含协议），例如 `http://123.hd-bkt.clouddn.com` |
+| `QINIU_KEY_PREFIX` | 上传图片的对象键前缀，默认 `pdf-pages` |
 
 ## 01_paper_preprocess
 
 ### `paper_preprocess.py`
 
-将 PDF 各页渲染为图片，调用多模态大模型提取结构化数据。默认读取 `01_paper_preprocess/paper`，输出到 `01_paper_preprocess/output`。
+将 PDF 各页渲染为图片，上传到七牛云公网空间，再以图片 URL 调用多模态大模型提取结构化数据。默认读取 `01_paper_preprocess/paper`，输出到 `01_paper_preprocess/output`。
 
 ```powershell
 python 01_paper_preprocess/paper_preprocess.py
@@ -56,7 +59,7 @@ python 01_paper_preprocess/paper_preprocess.py
 | --- | --- | --- | --- |
 | `--paper-dir PATH` | 否 | `01_paper_preprocess/paper` | PDF 输入目录，递归查找 `.pdf` |
 | `--output-dir PATH` | 否 | `01_paper_preprocess/output` | JSON 输出目录 |
-| `--pages-per-request N` | 否 | `PDF_PAGES_PER_REQUEST` 或 `10` | 按页切分 PDF，每批独立请求并作为一篇文献写入输出数组 |
+| `--pages-per-request N` | 否 | `PDF_IMAGES_PER_REQUEST`、`PDF_PAGES_PER_REQUEST` 或 `10` | 按页切分 PDF，每批独立请求并作为一篇文献写入输出数组 |
 
 ## 02_get_train_data
 

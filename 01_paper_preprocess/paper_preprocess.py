@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -19,7 +18,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from llm_client import LLMClientError, ResponsesClient, create_client
+from llm_client import (
+    LLMClientError,
+    QiniuUploader,
+    ResponsesClient,
+    create_client,
+    create_qiniu_uploader,
+    object_key_for_pdf_page,
+)
 
 
 DEFAULT_PAPER_DIR = "01_paper_preprocess/paper"
@@ -27,7 +33,7 @@ DEFAULT_OUTPUT_DIR = "01_paper_preprocess/output"
 DEFAULT_CONCURRENCY = 50
 DEFAULT_PDF_RENDER_DPI = 300
 DEFAULT_PAGES_PER_REQUEST = 10
-IMAGE_MIME_TYPE = "image/png"
+DEFAULT_IMAGE_MAX_MB = 4.0
 IMAGE_FORMAT = "png"
 
 
@@ -62,7 +68,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Maximum PDF pages sent in one model request. Defaults to "
-            f"PDF_PAGES_PER_REQUEST or {DEFAULT_PAGES_PER_REQUEST}."
+            f"PDF_IMAGES_PER_REQUEST, PDF_PAGES_PER_REQUEST, or {DEFAULT_PAGES_PER_REQUEST}."
         ),
     )
     return parser.parse_args()
@@ -95,6 +101,19 @@ def get_int_env(name: str, default: int) -> int:
     return value
 
 
+def get_positive_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got: {raw_value}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0, got: {value}")
+    return value
+
+
 def find_pdf_files(paper_dir: Path) -> list[Path]:
     if not paper_dir.exists():
         raise FileNotFoundError(f"Paper directory not found: {paper_dir}")
@@ -106,6 +125,8 @@ def find_pdf_files(paper_dir: Path) -> list[Path]:
 def iter_pdf_image_batches(
     path: Path,
     pages_per_request: int,
+    max_image_bytes: int,
+    uploader: QiniuUploader,
 ) -> Iterator[tuple[int, int, int, list[dict[str, Any]]]]:
     try:
         import fitz
@@ -130,11 +151,22 @@ def iter_pdf_image_batches(
                 page = document.load_page(page_index)
                 pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 image_bytes = pixmap.tobytes(IMAGE_FORMAT)
-                encoded = base64.b64encode(image_bytes).decode("ascii")
+                page_number = page_index + 1
+                if len(image_bytes) > max_image_bytes:
+                    actual_mb = len(image_bytes) / (1024 * 1024)
+                    limit_mb = max_image_bytes / (1024 * 1024)
+                    raise RuntimeError(
+                        f"Page {page_number} image is {actual_mb:.2f} MB, exceeding "
+                        f"PDF_IMAGE_MAX_MB={limit_mb:.2f} MB."
+                    )
+                image_url = uploader.upload_image(
+                    image_bytes,
+                    object_key_for_pdf_page(str(path.resolve()), page_number),
+                )
                 image_parts.append(
                     {
                         "type": "input_image",
-                        "image_url": f"data:{IMAGE_MIME_TYPE};base64,{encoded}",
+                        "image_url": image_url,
                     }
                 )
             yield batch_index + 1, batch_count, start_index + 1, image_parts
@@ -164,7 +196,6 @@ def request_extraction(
                 ],
             },
         ],
-        max_output_tokens=524288,
         reasoning_effort="high",
     )
 
@@ -198,6 +229,8 @@ def process_pdf(
     path: Path,
     client: ResponsesClient,
     pages_per_request: int,
+    max_image_bytes: int,
+    uploader: QiniuUploader,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "success",
@@ -207,7 +240,7 @@ def process_pdf(
 
     try:
         for batch_index, batch_count, start_page, image_parts in iter_pdf_image_batches(
-            path, pages_per_request
+            path, pages_per_request, max_image_bytes, uploader
         ):
             try:
                 response_text = request_extraction(
@@ -247,16 +280,22 @@ def main() -> int:
     started_at = time.perf_counter()
     args = parse_args()
     client = create_client()
+    uploader = create_qiniu_uploader()
     concurrency = get_int_env("MODEL_CONCURRENCY", DEFAULT_CONCURRENCY)
     pages_per_request = (
         args.pages_per_request
         if args.pages_per_request is not None
-        else get_int_env("PDF_PAGES_PER_REQUEST", DEFAULT_PAGES_PER_REQUEST)
+        else get_int_env(
+            "PDF_IMAGES_PER_REQUEST",
+            get_int_env("PDF_PAGES_PER_REQUEST", DEFAULT_PAGES_PER_REQUEST),
+        )
     )
     if pages_per_request < 1:
         raise ValueError(
             f"--pages-per-request must be greater than or equal to 1, got: {pages_per_request}"
         )
+    max_image_mb = get_positive_float_env("PDF_IMAGE_MAX_MB", DEFAULT_IMAGE_MAX_MB)
+    max_image_bytes = int(max_image_mb * 1024 * 1024)
     dpi = DEFAULT_PDF_RENDER_DPI
     paper_dir = resolve_project_path(args.paper_dir)
     output_dir = resolve_project_path(args.output_dir)
@@ -268,7 +307,7 @@ def main() -> int:
     print(f"Model: {client.model}")
     print(
         f"Concurrency: {concurrency}; render DPI: {dpi}; "
-        f"pages per request: {pages_per_request}"
+        f"images per request: {pages_per_request}; image size limit: {max_image_mb:g} MB"
     )
 
     pdf_files = find_pdf_files(paper_dir)
@@ -282,7 +321,7 @@ def main() -> int:
         return 0
 
     print(f"Found {len(pdf_files)} PDF file(s).")
-    print("Converting PDF pages in memory and parsing PDFs...")
+    print("Rendering PDF pages, uploading them to Qiniu, and parsing PDFs...")
     results_by_path: dict[Path, list[dict[str, Any]]] = {}
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
@@ -291,6 +330,8 @@ def main() -> int:
                 path,
                 client,
                 pages_per_request,
+                max_image_bytes,
+                uploader,
             ): path
             for path in pdf_files
         }

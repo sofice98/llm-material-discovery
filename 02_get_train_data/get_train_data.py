@@ -27,7 +27,6 @@ DEFAULT_INPUT_DIR = PROJECT_ROOT / "01_paper_preprocess"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output"
 DEFAULT_CONCURRENCY = 50
 DEFAULT_MAX_SAMPLE_CHARS = 8000
-DEFAULT_MAX_OUTPUT_TOKENS = 65536
 
 TASKS = {
     "01_forward_property_prediction": "forward_property_prediction",
@@ -206,7 +205,6 @@ def request_samples(
     )
     response_text = client.respond(
         [{"role": "user", "content": user_text}],
-        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
         reasoning_effort="high",
     )
     parsed = parse_json_from_text(response_text)
