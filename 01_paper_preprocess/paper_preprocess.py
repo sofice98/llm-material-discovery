@@ -191,12 +191,12 @@ def request_extraction(
                 "role": "user",
                 "content": [
                     *image_parts,
-                    {"type": "input_text", "text": batch_note},
-                    {"type": "input_text", "text": EXTRACTION_PROMPT},
+                    {"type": "input_text", "text": batch_note}
+                    # {"type": "input_text", "text": EXTRACTION_PROMPT},
                 ],
             },
         ],
-        reasoning_effort="high",
+        reasoning_effort="low",
     )
 
 

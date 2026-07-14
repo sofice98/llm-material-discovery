@@ -6,6 +6,7 @@ import atexit
 import os
 import threading
 import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,12 @@ class ResponsesClient:
     def _post_with_retries(self, body: dict[str, Any]) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
+            # "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
             "Content-Type": "application/json",
+            # "Accept": "*/*",
+            # "Host": urlsplit(self.url).netloc,
+            # "Accept-Encoding": "gzip, deflate, br",
+            # "Connection": "keep-alive",
         }
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
