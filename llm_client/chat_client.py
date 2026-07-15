@@ -42,6 +42,7 @@ class ResponsesClient:
         input_data: str | list[dict[str, Any]],
         *,
         reasoning_effort: str,
+        max_output_tokens: int | None = None
     ) -> str:
         body: dict[str, Any] = {
             "model": self.model,
@@ -49,6 +50,8 @@ class ResponsesClient:
         }
         if reasoning_effort:
             body["reasoning"] = {"effort": reasoning_effort}
+        if max_output_tokens is not None:
+            body["max_output_tokens"] = max_output_tokens
 
         payload = self._post_with_retries(body)
         accumulate_token_usage(payload)
@@ -57,12 +60,7 @@ class ResponsesClient:
     def _post_with_retries(self, body: dict[str, Any]) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
-            # "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
             "Content-Type": "application/json",
-            # "Accept": "*/*",
-            # "Host": urlsplit(self.url).netloc,
-            # "Accept-Encoding": "gzip, deflate, br",
-            # "Connection": "keep-alive",
         }
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -76,6 +74,7 @@ class ResponsesClient:
                 if (
                     response.status_code in RETRYABLE_STATUS_CODES
                     or response.status_code >= 500
+                    or is_retryable_image_url_rejection(response)
                 ) and attempt < self.max_retries:
                     time.sleep(2**attempt)
                     continue
@@ -91,7 +90,7 @@ class ResponsesClient:
                     continue
                 response_body = ""
                 if isinstance(exc, requests.RequestException) and exc.response is not None:
-                    response_body = f"; response body: {exc.response.text[:1000]}"
+                    response_body = f"; response body: {exc.response.text[:150]}"
                 raise LLMClientError(f"Responses API request failed: {exc}{response_body}") from exc
         raise LLMClientError(f"Responses API request failed: {last_error}")
 
@@ -125,6 +124,19 @@ def convert_to_responses_url(url: str) -> str:
     if normalized.endswith("/chat/completions"):
         return normalized[: -len("/chat/completions")] + "/responses"
     return normalized
+
+
+def is_retryable_image_url_rejection(response: requests.Response) -> bool:
+    """Retry a transient remote-image fetch rejection from the provider."""
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    return isinstance(message, str) and "disallowed url:" in message.lower()
 
 
 def accumulate_token_usage(payload: dict[str, Any]) -> None:

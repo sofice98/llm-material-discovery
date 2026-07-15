@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,18 +26,62 @@ from llm_client import (
     create_qiniu_uploader,
     object_key_for_pdf_page,
 )
+from llm_client.logging_utils import configure_script_logging
 
 
 DEFAULT_PAPER_DIR = "01_paper_preprocess/paper"
 DEFAULT_OUTPUT_DIR = "01_paper_preprocess/output"
-DEFAULT_CONCURRENCY = 50
+DEFAULT_CONCURRENCY = 10
 DEFAULT_PDF_RENDER_DPI = 300
-DEFAULT_PAGES_PER_REQUEST = 10
-DEFAULT_IMAGE_MAX_MB = 4.0
+DEFAULT_PAGES_PER_REQUEST = 20
+DEFAULT_IMAGE_MAX_MB = 10.0
+DEFAULT_MAX_OUTPUT_TOKENS = 524288
+DEFAULT_SCHEMA_RETRIES = 1
 IMAGE_FORMAT = "png"
+
+REQUIRED_TOP_LEVEL_KEYS = (
+    "文献元数据",
+    "文献原文信息",
+    "基体信息",
+    "粉末属性",
+    "喷涂工艺参数",
+    "微观组织结构",
+    "力学性能参数",
+    "摩擦学性能",
+    "腐蚀性能",
+    "涂层组分",
+    "热物理性能",
+    "耐久性试验",
+)
+SCHEMA_RETRY_PROMPT = (
+    "上一份回答未满足 JSON 结构要求。请重新从提供的页面提取，且只返回一个完整 JSON "
+    "对象。根对象必须包含以下全部字段："
+    + "、".join(REQUIRED_TOP_LEVEL_KEYS)
+    + "。不要把‘文献元数据’中的字段直接放在根对象；没有信息的字段按原要求填 null 或 []。"
+)
 
 
 EXTRACTION_PROMPT = Path(__file__).with_name("extraction_prompt.md").read_text(encoding="utf-8").strip()
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,12 +108,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pages-per-request",
-        type=int,
-        default=None,
-        help=(
-            "Maximum PDF pages sent in one model request. Defaults to "
-            f"PDF_IMAGES_PER_REQUEST, PDF_PAGES_PER_REQUEST, or {DEFAULT_PAGES_PER_REQUEST}."
-        ),
+        type=positive_int,
+        default=DEFAULT_PAGES_PER_REQUEST,
+        help=f"Maximum PDF pages sent in one model request (default: {DEFAULT_PAGES_PER_REQUEST}).",
+    )
+    parser.add_argument(
+        "--image-max-mb",
+        type=positive_float,
+        default=DEFAULT_IMAGE_MAX_MB,
+        help=f"Maximum rendered PDF page image size in MB (default: {DEFAULT_IMAGE_MAX_MB:g}).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Concurrent model requests (default: {DEFAULT_CONCURRENCY}).",
     )
     return parser.parse_args()
 
@@ -88,38 +141,29 @@ def format_path(path: Path) -> str:
         return path.as_posix()
 
 
-def get_int_env(name: str, default: int) -> int:
-    raw_value = os.getenv(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got: {raw_value}") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be greater than or equal to 1, got: {value}")
-    return value
-
-
-def get_positive_float_env(name: str, default: float) -> float:
-    raw_value = os.getenv(name, "").strip()
-    if not raw_value:
-        return default
-    try:
-        value = float(raw_value)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a number, got: {raw_value}") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be greater than 0, got: {value}")
-    return value
-
-
 def find_pdf_files(paper_dir: Path) -> list[Path]:
     if not paper_dir.exists():
         raise FileNotFoundError(f"Paper directory not found: {paper_dir}")
     if not paper_dir.is_dir():
         raise NotADirectoryError(f"Paper path is not a directory: {paper_dir}")
-    return sorted(path for path in paper_dir.rglob("*.pdf") if path.is_file())
+    return sorted(path for path in paper_dir.glob("*.pdf") if path.is_file())
+
+
+def move_processed_pdfs(paper_dir: Path, paths: list[Path], timestamp: str) -> int:
+    if not paths:
+        return 0
+
+    processed_dir = paper_dir / f"processed_{timestamp}"
+    processed_dir.mkdir()
+    moved_count = 0
+    for path in paths:
+        try:
+            shutil.move(str(path), str(processed_dir / path.name))
+            moved_count += 1
+        except OSError as exc:
+            print(f"[move failed] {format_path(path)}: {exc}", file=sys.stderr)
+    print(f"Moved {moved_count} successful PDF file(s) to {format_path(processed_dir)}.")
+    return moved_count
 
 
 def iter_pdf_image_batches(
@@ -157,7 +201,7 @@ def iter_pdf_image_batches(
                     limit_mb = max_image_bytes / (1024 * 1024)
                     raise RuntimeError(
                         f"Page {page_number} image is {actual_mb:.2f} MB, exceeding "
-                        f"PDF_IMAGE_MAX_MB={limit_mb:.2f} MB."
+                        f"--image-max-mb={limit_mb:.2f} MB."
                     )
                 image_url = uploader.upload_image(
                     image_bytes,
@@ -175,28 +219,23 @@ def iter_pdf_image_batches(
 def request_extraction(
     image_parts: list[dict[str, Any]],
     client: ResponsesClient,
-    batch_index: int,
-    batch_count: int,
-    start_page: int,
+    correction_prompt: str | None = None,
 ) -> str:
-    end_page = start_page + len(image_parts) - 1
-    batch_note = (
-        f"这是由一个 PDF 切分出的第 {batch_index}/{batch_count} 份，包含原 PDF "
-        f"第 {start_page}-{end_page} 页。请将本次提供的页面独立视为一篇文献进行提取，"
-        "只使用当前页面中明确出现的信息，不要补全其他分页中的内容。"
-    )
+    content: list[dict[str, Any]] = [
+        *image_parts,
+        {"type": "input_text", "text": EXTRACTION_PROMPT},
+    ]
+    if correction_prompt:
+        content.append({"type": "input_text", "text": correction_prompt})
     return client.respond(
         [
             {
                 "role": "user",
-                "content": [
-                    *image_parts,
-                    {"type": "input_text", "text": batch_note}
-                    # {"type": "input_text", "text": EXTRACTION_PROMPT},
-                ],
+                "content": content,
             },
         ],
-        reasoning_effort="low",
+        reasoning_effort="none",
+        max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
     )
 
 
@@ -225,12 +264,54 @@ def parse_json_from_text(text: str) -> Any:
         raise
 
 
+class IncompleteDocumentSchemaError(RuntimeError):
+    pass
+
+
+def validate_extraction_schema(extracted: Any) -> None:
+    if not isinstance(extracted, dict):
+        raise IncompleteDocumentSchemaError(
+            "Model returned JSON, but the top-level value is not an object."
+        )
+    missing_keys = [key for key in REQUIRED_TOP_LEVEL_KEYS if key not in extracted]
+    if missing_keys:
+        raise IncompleteDocumentSchemaError(
+            "Model returned an incomplete document schema; missing top-level keys: "
+            + ", ".join(missing_keys)
+        )
+
+
+def extract_complete_document(
+    image_parts: list[dict[str, Any]],
+    client: ResponsesClient,
+    schema_retries: int,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(schema_retries + 1):
+        response_text = request_extraction(
+            image_parts,
+            client,
+            SCHEMA_RETRY_PROMPT if attempt else None,
+        )
+        try:
+            extracted = parse_json_from_text(response_text)
+            validate_extraction_schema(extracted)
+            return extracted
+        except (json.JSONDecodeError, IncompleteDocumentSchemaError) as exc:
+            last_error = exc
+    raise RuntimeError(
+        f"Model did not return a complete document schema after {schema_retries + 1} attempt(s): "
+        f"{last_error}"
+    )
+
+
 def process_pdf(
     path: Path,
     client: ResponsesClient,
     pages_per_request: int,
     max_image_bytes: int,
     uploader: QiniuUploader,
+    schema_retries: int,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "success",
@@ -243,18 +324,11 @@ def process_pdf(
             path, pages_per_request, max_image_bytes, uploader
         ):
             try:
-                response_text = request_extraction(
+                extracted = extract_complete_document(
                     image_parts,
                     client,
-                    batch_index,
-                    batch_count,
-                    start_page,
+                    schema_retries,
                 )
-                extracted = parse_json_from_text(response_text)
-                if not isinstance(extracted, dict):
-                    raise RuntimeError(
-                        "Model returned JSON, but the top-level value is not an object."
-                    )
                 result["data"].append(extracted)
             except Exception as exc:
                 result["errors"].append(
@@ -281,21 +355,11 @@ def main() -> int:
     args = parse_args()
     client = create_client()
     uploader = create_qiniu_uploader()
-    concurrency = get_int_env("MODEL_CONCURRENCY", DEFAULT_CONCURRENCY)
-    pages_per_request = (
-        args.pages_per_request
-        if args.pages_per_request is not None
-        else get_int_env(
-            "PDF_IMAGES_PER_REQUEST",
-            get_int_env("PDF_PAGES_PER_REQUEST", DEFAULT_PAGES_PER_REQUEST),
-        )
-    )
-    if pages_per_request < 1:
-        raise ValueError(
-            f"--pages-per-request must be greater than or equal to 1, got: {pages_per_request}"
-        )
-    max_image_mb = get_positive_float_env("PDF_IMAGE_MAX_MB", DEFAULT_IMAGE_MAX_MB)
+    concurrency = args.concurrency
+    pages_per_request = args.pages_per_request
+    max_image_mb = args.image_max_mb
     max_image_bytes = int(max_image_mb * 1024 * 1024)
+    schema_retries = DEFAULT_SCHEMA_RETRIES
     dpi = DEFAULT_PDF_RENDER_DPI
     paper_dir = resolve_project_path(args.paper_dir)
     output_dir = resolve_project_path(args.output_dir)
@@ -307,7 +371,8 @@ def main() -> int:
     print(f"Model: {client.model}")
     print(
         f"Concurrency: {concurrency}; render DPI: {dpi}; "
-        f"images per request: {pages_per_request}; image size limit: {max_image_mb:g} MB"
+        f"images per request: {pages_per_request}; image size limit: {max_image_mb:g} MB; "
+        f"schema retries: {schema_retries}"
     )
 
     pdf_files = find_pdf_files(paper_dir)
@@ -323,6 +388,7 @@ def main() -> int:
     print(f"Found {len(pdf_files)} PDF file(s).")
     print("Rendering PDF pages, uploading them to Qiniu, and parsing PDFs...")
     results_by_path: dict[Path, list[dict[str, Any]]] = {}
+    successful_paths: list[Path] = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {
             executor.submit(
@@ -332,6 +398,7 @@ def main() -> int:
                 pages_per_request,
                 max_image_bytes,
                 uploader,
+                schema_retries,
             ): path
             for path in pdf_files
         }
@@ -349,6 +416,7 @@ def main() -> int:
             if isinstance(data, list) and data:
                 results_by_path[path] = data
             if status == "success":
+                successful_paths.append(path)
                 tqdm.write(f"[success] {relative_path}: {len(data)} part(s)")
             elif status == "partial":
                 tqdm.write(
@@ -368,6 +436,7 @@ def main() -> int:
         for paper in results_by_path.get(path, [])
     ]
     write_output(output_path, results)
+    move_processed_pdfs(paper_dir, successful_paths, timestamp)
     failed_count = len(pdf_files) - len(results_by_path)
     elapsed = time.perf_counter() - started_at
     print("Extraction finished.")
@@ -379,6 +448,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_script_logging(__file__)
     try:
         raise SystemExit(main())
     except LLMClientError as exc:

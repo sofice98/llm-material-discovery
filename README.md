@@ -32,11 +32,8 @@ pip install -r requirements.txt
 | 变量 | 说明 |
 | --- | --- |
 | `API_KEY` | 大模型 API 密钥 |
-| `MODEL_URL` | Responses API 地址，例如 `https://apinebula.com/v1/responses` |
+| `MODEL_URL` | Responses API 地址，例如 `https://api.openai.com/v1/responses` |
 | `MODEL` | 模型名称 |
-| `MODEL_CONCURRENCY` | 并发数，默认 `50` |
-| `PDF_IMAGES_PER_REQUEST` | 每次模型请求最多包含的 PDF 页面图片数量，默认 `10` |
-| `PDF_IMAGE_MAX_MB` | 单张渲染后的 PDF 页面图片最大大小（MB），默认 `10`；超出时不上传也不请求模型 |
 | `MODEL_TIMEOUT_SECONDS` | 模型请求超时秒数，默认 `600` |
 | `MODEL_MAX_RETRIES` | 模型请求失败重试次数，默认 `2` |
 | `QINIU_ACCESS_KEY` | 七牛云 AccessKey |
@@ -59,7 +56,9 @@ python 01_paper_preprocess/paper_preprocess.py
 | --- | --- | --- | --- |
 | `--paper-dir PATH` | 否 | `01_paper_preprocess/paper` | PDF 输入目录，递归查找 `.pdf` |
 | `--output-dir PATH` | 否 | `01_paper_preprocess/output` | JSON 输出目录 |
-| `--pages-per-request N` | 否 | `PDF_IMAGES_PER_REQUEST`、`PDF_PAGES_PER_REQUEST` 或 `10` | 按页切分 PDF，每批独立请求并作为一篇文献写入输出数组 |
+| `--pages-per-request N` | 否 | `20` | 每次大模型请求包含的最大 PDF 页数 |
+| `--image-max-mb N` | 否 | `10` | 单张渲染 PDF 页面图片的最大大小（MB）；超出时不上传也不请求模型 |
+| `--concurrency N` | 否 | `10` | 大模型请求并发数 |
 
 ## 02_get_train_data
 
@@ -74,8 +73,10 @@ python 02_get_train_data/get_train_data.py --method SFT --input 01_paper_preproc
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `--method {CPT,SFT,DPO}` | 是 | - | 训练数据格式和提示词目录 |
-| `--input PATH` | 否 | 最新的 `paper_*.json` | 输入论文 JSON |
-| `--output-dir PATH` | 否 | `02_get_train_data/output` | JSONL 输出目录；错误信息直接输出到控制台 |
+| `--input PATH` | 是 | - | 输入论文 JSON |
+| `--concurrency N` | 否 | `10` | 大模型请求并发数 |
+
+JSONL 输出固定保存到 `02_get_train_data/output`；错误信息直接输出到控制台。
 
 ### `jsonl_tools.py translate`
 
@@ -89,12 +90,11 @@ python 02_get_train_data/jsonl_tools.py translate input.jsonl --language en
 | --- | --- | --- | --- |
 | `input` | 是 | - | 输入 JSONL |
 | `--language {zh,en}` | 是 | - | 目标语言 |
-| `-o, --output PATH` | 否 | `<input>_<language>_<timestamp>.jsonl` | 输出文件；相对路径以项目根目录为基准 |
-| `--fields FIELD ...` | 否 | 常见训练文本字段 | 需要翻译的顶层字符串字段 |
 | `--batch-size N` | 否 | `10` | 单次请求最多包含的样本数 |
-| `--concurrency N` | 否 | `MODEL_CONCURRENCY` | API 并发数 |
+| `--concurrency N` | 否 | `10` | API 并发数 |
 | `--max-batch-chars N` | 否 | `30000` | 单批最大源字符数 |
-| `--overwrite` | 否 | 关闭 | 允许覆盖已有输出文件 |
+
+翻译固定处理 `instruction`、`input`、`output`、`text`、`prompt`、`chosen` 和 `rejected` 顶层字符串字段，并始终生成一个新的带时间戳输出文件。
 
 ### `jsonl_tools.py merge`
 
@@ -108,12 +108,10 @@ python 02_get_train_data/jsonl_tools.py merge a.jsonl b.jsonl
 | --- | --- | --- | --- |
 | `inputs` | 是 | - | 一个或多个输入 JSONL |
 | `-o, --output PATH` | 否 | `merged_<timestamp>.jsonl` | 输出文件；相对路径以项目根目录为基准 |
-| `--deduplicate` | 否 | 关闭 | 删除内容相同的 JSON 记录 |
-| `--overwrite` | 否 | 关闭 | 允许覆盖已有输出文件 |
 
 ### `jsonl_tools.py count`
 
-统计指定 JSONL 中有效 JSON 对象的样本数。
+统计指定 JSONL 中有效 JSON 对象的样本数；也支持顶层为数组的 `.json` 文件。
 
 ```powershell
 python 02_get_train_data/jsonl_tools.py count train.jsonl
@@ -121,7 +119,9 @@ python 02_get_train_data/jsonl_tools.py count train.jsonl
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `input` | 是 | - | 输入 JSONL |
+| `input` | 是 | - | 输入 JSONL，或顶层为数组的 JSON 文件 |
+
+传入 `.json` 文件时，顶层必须是数组；否则命令会报错并提示改用 JSONL 或提供数组格式的 JSON 文件。
 
 ### `jsonl_tools.py task-stats`
 
@@ -148,7 +148,6 @@ python 02_get_train_data/jsonl_tools.py tokens train.jsonl
 | `input` | 是 | - | 输入 JSONL |
 | `--model NAME` | 否 | - | 根据模型名称选择 tiktoken 编码 |
 | `--encoding NAME` | 否 | `cl100k_base` | 指定 tiktoken 编码，与 `--model` 互斥 |
-| `--fields FIELD ...` | 否 | 完整 JSON 记录 | 只统计指定顶层字段 |
 
 所有相对输入路径均以项目根目录为基准。可通过以下命令查看实时帮助：
 

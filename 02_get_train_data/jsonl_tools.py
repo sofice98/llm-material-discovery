@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from llm_client import ResponsesClient, create_client
+from llm_client.logging_utils import configure_script_logging
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -52,15 +52,9 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     translate = subparsers.add_parser(
-        "translate", help="Translate selected text fields in a JSONL file."
+        "translate", help="Translate common text fields in a JSONL file."
     )
     translate.add_argument("input", type=Path, help="Source JSONL file.")
-    translate.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        help="Output file. Defaults to 02_get_train_data/output/<input>_<language>_<timestamp>.jsonl.",
-    )
     translate.add_argument(
         "--language",
         required=True,
@@ -68,25 +62,19 @@ def parse_args() -> argparse.Namespace:
         help="Target language: zh (Chinese) or en (English).",
     )
     translate.add_argument(
-        "--fields",
-        nargs="+",
-        default=list(DEFAULT_TRANSLATE_FIELDS),
-        help="Top-level string fields to translate.",
-    )
-    translate.add_argument(
         "--batch-size", type=positive_int, default=10, help="Records per API request."
     )
     translate.add_argument(
-        "--concurrency", type=positive_int, default=None, help="Concurrent API requests."
+        "--concurrency",
+        type=positive_int,
+        default=10,
+        help="Concurrent API requests (default: 10).",
     )
     translate.add_argument(
         "--max-batch-chars",
         type=positive_int,
         default=30000,
         help="Maximum serialized source characters in one API request.",
-    )
-    translate.add_argument(
-        "--overwrite", action="store_true", help="Allow replacing the output file."
     )
 
     merge = subparsers.add_parser("merge", help="Merge multiple JSONL files in order.")
@@ -97,20 +85,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Output file. Defaults to 02_get_train_data/output/merged_<timestamp>.jsonl.",
     )
-    merge.add_argument(
-        "--deduplicate", action="store_true", help="Remove identical JSON records."
-    )
-    merge.add_argument(
-        "--overwrite", action="store_true", help="Allow replacing the output file."
-    )
 
     stats = subparsers.add_parser(
         "task-stats", help="Show task_type counts and proportions for SFT JSONL."
     )
     stats.add_argument("input", type=Path, help="SFT JSONL file.")
 
-    count = subparsers.add_parser("count", help="Count valid records in a JSONL file.")
-    count.add_argument("input", type=Path, help="JSONL file.")
+    count = subparsers.add_parser(
+        "count", help="Count valid records in a JSONL file or items in a JSON array file."
+    )
+    count.add_argument(
+        "input", type=Path, help="JSONL file or JSON file with a top-level array."
+    )
 
     tokens = subparsers.add_parser(
         "tokens", help="Count JSONL tokens with a tiktoken tokenizer."
@@ -120,11 +106,6 @@ def parse_args() -> argparse.Namespace:
     tokenizer.add_argument("--model", help="Use tiktoken encoding_for_model(model).")
     tokenizer.add_argument(
         "--encoding", default="cl100k_base", help="tiktoken encoding name."
-    )
-    tokens.add_argument(
-        "--fields",
-        nargs="+",
-        help="Count only these top-level fields instead of each complete JSONL line.",
     )
     return parser.parse_args()
 
@@ -136,14 +117,14 @@ def resolve_path(path: Path) -> Path:
 def require_input(path: Path) -> Path:
     resolved = resolve_path(path)
     if not resolved.is_file():
-        raise FileNotFoundError(f"JSONL file not found: {resolved}")
+        raise FileNotFoundError(f"Input file not found: {resolved}")
     return resolved
 
 
-def prepare_output(path: Path, overwrite: bool) -> Path:
+def prepare_output(path: Path) -> Path:
     resolved = resolve_path(path)
-    if resolved.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists; use --overwrite: {resolved}")
+    if resolved.exists():
+        raise FileExistsError(f"Output already exists; choose a new output path: {resolved}")
     resolved.parent.mkdir(parents=True, exist_ok=True)
     return resolved
 
@@ -189,13 +170,6 @@ def parse_json_response(text: str) -> Any:
         raise
 
 
-def load_model_config() -> dict[str, Any]:
-    config: dict[str, Any] = {
-        "concurrency": int(os.getenv("MODEL_CONCURRENCY", "10")),
-    }
-    return config
-
-
 def make_batches(
     records: list[dict[str, Any]], fields: list[str], batch_size: int, max_chars: int
 ) -> list[list[dict[str, Any]]]:
@@ -227,7 +201,6 @@ def make_batches(
 def translate_batch(
     batch: list[dict[str, Any]],
     language: str,
-    config: dict[str, Any],
     client: ResponsesClient,
 ) -> dict[int, dict[str, str]]:
     source_json = json.dumps(batch, ensure_ascii=False, separators=(",", ":"))
@@ -267,17 +240,16 @@ def translate_batch(
 
 def command_translate(args: argparse.Namespace) -> None:
     input_path = require_input(args.input)
-    requested_output = args.output or timestamped_output(
-        f"{input_path.stem}_{args.language}"
+    output_path = prepare_output(
+        timestamped_output(f"{input_path.stem}_{args.language}")
     )
-    output_path = prepare_output(requested_output, args.overwrite)
     if input_path == output_path:
         raise ValueError("Input and output paths must be different.")
     records = [record for _, record in iter_jsonl(input_path)]
-    batches = make_batches(records, args.fields, args.batch_size, args.max_batch_chars)
+    batches = make_batches(
+        records, list(DEFAULT_TRANSLATE_FIELDS), args.batch_size, args.max_batch_chars
+    )
     client = create_client()
-    config = load_model_config()
-    concurrency = args.concurrency or config["concurrency"]
     results: dict[int, dict[str, str]] = {}
     failed_batches: list[tuple[list[dict[str, Any]], str]] = []
 
@@ -285,9 +257,9 @@ def command_translate(args: argparse.Namespace) -> None:
         f"Translating {len(records)} records in {len(batches)} batches to "
         f"{LANGUAGES[args.language]} with {client.model}..."
     )
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         future_to_batch = {
-            executor.submit(translate_batch, batch, args.language, config, client): batch
+            executor.submit(translate_batch, batch, args.language, client): batch
             for batch in batches
         }
         for future in tqdm(
@@ -295,9 +267,17 @@ def command_translate(args: argparse.Namespace) -> None:
         ):
             batch = future_to_batch[future]
             try:
-                results.update(future.result())
+                translated = future.result()
+                results.update(translated)
+                tqdm.write(
+                    f"[success] Samples {batch[0]['id']} to {batch[-1]['id']}: "
+                    f"translated {len(translated)} samples"
+                )
             except Exception as exc:
                 failed_batches.append((batch, str(exc)))
+                tqdm.write(
+                    f"[failed] Samples {batch[0]['id']} to {batch[-1]['id']}: {exc}"
+                )
 
     with output_path.open("w", encoding="utf-8", newline="\n") as file:
         for index, record in enumerate(records):
@@ -310,34 +290,21 @@ def command_translate(args: argparse.Namespace) -> None:
     print(f"Failed requests: {len(failed_batches)}")
     print(f"Translated samples: {len(results)}")
     print(f"Untranslated samples: {sum(len(batch) for batch, _ in failed_batches)}")
-    for batch, error in failed_batches:
-        print(f"[failed] Samples {batch[0]['id']} to {batch[-1]['id']}: {error}")
 
 
 def command_merge(args: argparse.Namespace) -> None:
     input_paths = [require_input(path) for path in args.inputs]
-    output_path = prepare_output(
-        args.output or timestamped_output("merged"), args.overwrite
-    )
+    output_path = prepare_output(args.output or timestamped_output("merged"))
     if output_path in input_paths:
         raise ValueError("The output path cannot also be an input path.")
-    seen: set[str] = set()
     written = 0
-    duplicates = 0
     with output_path.open("w", encoding="utf-8", newline="\n") as output:
         for input_path in input_paths:
             for _, record in iter_jsonl(input_path):
                 line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-                key = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-                if args.deduplicate and key in seen:
-                    duplicates += 1
-                    continue
-                seen.add(key)
                 output.write(line + "\n")
                 written += 1
     print(f"Merged {len(input_paths)} files and wrote {written} records to {output_path}")
-    if args.deduplicate:
-        print(f"Removed {duplicates} duplicate records")
 
 
 def command_task_stats(args: argparse.Namespace) -> None:
@@ -364,7 +331,19 @@ def command_task_stats(args: argparse.Namespace) -> None:
 
 def command_count(args: argparse.Namespace) -> None:
     input_path = require_input(args.input)
-    sample_count = sum(1 for _ in iter_jsonl(input_path))
+    if input_path.suffix.lower() == ".json":
+        try:
+            with input_path.open("r", encoding="utf-8-sig") as file:
+                records = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise JsonlError(f"Invalid JSON in {input_path}: {exc}") from exc
+        if not isinstance(records, list):
+            raise JsonlError(
+                f"Expected a top-level JSON array in {input_path}; use a JSONL file for line-delimited records."
+            )
+        sample_count = len(records)
+    else:
+        sample_count = sum(1 for _ in iter_jsonl(input_path))
     print(f"File: {input_path}")
     print(f"Samples: {sample_count}")
 
@@ -383,12 +362,7 @@ def command_tokens(args: argparse.Namespace) -> None:
     )
     counts: list[int] = []
     for _, record in tqdm(iter_jsonl(input_path), desc="Counting tokens"):
-        if args.fields:
-            text = "\n".join(
-                str(record[field]) for field in args.fields if field in record
-            )
-        else:
-            text = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        text = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         counts.append(len(encoding.encode(text)))
     total = sum(counts)
     print(f"File: {input_path}")
@@ -414,6 +388,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_script_logging(__file__)
     try:
         raise SystemExit(main())
     except (FileNotFoundError, FileExistsError, JsonlError, ValueError, RuntimeError) as exc:

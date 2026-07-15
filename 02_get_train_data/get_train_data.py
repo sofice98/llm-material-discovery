@@ -19,14 +19,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from llm_client import LLMClientError, ResponsesClient, create_client
+from llm_client.logging_utils import configure_script_logging
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
-DEFAULT_INPUT_DIR = PROJECT_ROOT / "01_paper_preprocess"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "output"
-DEFAULT_CONCURRENCY = 50
+DEFAULT_CONCURRENCY = 10
 DEFAULT_MAX_SAMPLE_CHARS = 8000
+DEFAULT_MAX_OUTPUT_TOKENS = 524288
 
 TASKS = {
     "01_forward_property_prediction": "forward_property_prediction",
@@ -63,16 +64,27 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
+        required=True,
         type=Path,
-        help="Input paper JSON. Defaults to the newest 01_paper_preprocess/paper_*.json.",
+        help="Input paper JSON.",
     )
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory for timestamped JSONL output files.",
+        "--concurrency",
+        type=positive_int,
+        default=DEFAULT_CONCURRENCY,
+        help=f"Concurrent model requests (default: {DEFAULT_CONCURRENCY}).",
     )
     return parser.parse_args()
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 def get_positive_int_env(name: str, default: int) -> int:
@@ -90,7 +102,6 @@ def get_positive_int_env(name: str, default: int) -> int:
 
 def load_config() -> dict[str, Any]:
     config: dict[str, Any] = {
-        "concurrency": get_positive_int_env("MODEL_CONCURRENCY", DEFAULT_CONCURRENCY),
         "max_sample_chars": get_positive_int_env(
             "TRAIN_MAX_SAMPLE_CHARS", DEFAULT_MAX_SAMPLE_CHARS
         ),
@@ -107,19 +118,6 @@ def display_path(path: Path) -> str:
         return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
         return str(path.resolve())
-
-
-def find_latest_input() -> Path:
-    candidates = sorted(
-        DEFAULT_INPUT_DIR.glob("paper_*.json"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    if not candidates:
-        raise FileNotFoundError(
-            f"No paper_*.json files found in {display_path(DEFAULT_INPUT_DIR)}"
-        )
-    return candidates[0]
 
 
 def load_papers(input_path: Path) -> list[dict[str, Any]]:
@@ -205,7 +203,8 @@ def request_samples(
     )
     response_text = client.respond(
         [{"role": "user", "content": user_text}],
-        reasoning_effort="high",
+        reasoning_effort="medium",
+        # max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
     )
     parsed = parse_json_from_text(response_text)
     if isinstance(parsed, dict):
@@ -287,8 +286,8 @@ def main() -> int:
     args = parse_args()
     client = create_client()
     config = load_config()
-    input_path = resolve_path(args.input) if args.input else find_latest_input()
-    output_dir = resolve_path(args.output_dir)
+    input_path = resolve_path(args.input)
+    output_dir = DEFAULT_OUTPUT_DIR
     if not input_path.is_file():
         raise FileNotFoundError(f"Input JSON not found: {input_path}")
 
@@ -303,7 +302,7 @@ def main() -> int:
     print(f"Model: {client.model}")
     print(
         f"Papers: {len(papers)}; tasks: {len(prompts)}; "
-        f"API calls: {len(papers) * len(prompts)}; concurrency: {config['concurrency']}"
+        f"API calls: {len(papers) * len(prompts)}; concurrency: {args.concurrency}"
     )
 
     results: list[dict[str, Any]] = []
@@ -312,7 +311,7 @@ def main() -> int:
         for paper_index, paper in enumerate(papers)
         for prompt_name, prompt in prompts.items()
     ]
-    with ThreadPoolExecutor(max_workers=config["concurrency"]) as executor:
+    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = [
             executor.submit(
                 process_job,
@@ -335,6 +334,12 @@ def main() -> int:
                 tqdm.write(
                     f"[failed] Paper {result['paper_index'] + 1}, "
                     f"task {result['task']}: {result['error']}"
+                )
+            else:
+                tqdm.write(
+                    f"[success] Paper {result['paper_index'] + 1}, "
+                    f"task {result['task']}: generated {len(result['samples'])} samples "
+                    f"({result['discarded']} discarded)"
                 )
 
     results.sort(key=lambda item: (item["paper_index"], item["task"]))
@@ -364,6 +369,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_script_logging(__file__)
     try:
         raise SystemExit(main())
     except (ConfigError, LLMClientError, FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
