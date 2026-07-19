@@ -32,6 +32,7 @@ DEFAULT_TRANSLATE_FIELDS = (
     "rejected",
 )
 LANGUAGES = {"zh": "Simplified Chinese", "en": "English"}
+DEFAULT_TOKENIZER_MODEL = "Qwen/Qwen3.6-27B"
 
 
 class JsonlError(RuntimeError):
@@ -99,13 +100,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     tokens = subparsers.add_parser(
-        "tokens", help="Count JSONL tokens with a tiktoken tokenizer."
+        "tokens", help="Count all JSONL file tokens with a Hugging Face tokenizer."
     )
     tokens.add_argument("input", type=Path, help="JSONL file.")
-    tokenizer = tokens.add_mutually_exclusive_group()
-    tokenizer.add_argument("--model", help="Use tiktoken encoding_for_model(model).")
-    tokenizer.add_argument(
-        "--encoding", default="cl100k_base", help="tiktoken encoding name."
+    tokens.add_argument(
+        "--tokenizer-model",
+        default=DEFAULT_TOKENIZER_MODEL,
+        help=f"Hugging Face tokenizer model (default: {DEFAULT_TOKENIZER_MODEL}).",
     )
     return parser.parse_args()
 
@@ -350,28 +351,29 @@ def command_count(args: argparse.Namespace) -> None:
 
 def command_tokens(args: argparse.Namespace) -> None:
     try:
-        import tiktoken
+        from transformers import AutoTokenizer
     except ImportError as exc:
-        raise RuntimeError("tiktoken is required; run: pip install -r requirements.txt") from exc
+        raise RuntimeError(
+            "transformers is required; run: pip install transformers"
+        ) from exc
 
     input_path = require_input(args.input)
-    encoding = (
-        tiktoken.encoding_for_model(args.model)
-        if args.model
-        else tiktoken.get_encoding(args.encoding)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_model,
+        trust_remote_code=True,
     )
     counts: list[int] = []
-    for _, record in tqdm(iter_jsonl(input_path), desc="Counting tokens"):
-        text = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        counts.append(len(encoding.encode(text)))
+    with input_path.open("r", encoding="utf-8-sig") as file:
+        for line in tqdm(file, desc="Counting tokens"):
+            counts.append(len(tokenizer.encode(line, add_special_tokens=False)))
     total = sum(counts)
     print(f"File: {input_path}")
-    print(f"Tokenizer: {encoding.name}")
-    print(f"Records: {len(counts)}")
+    print(f"Tokenizer: {args.tokenizer_model}")
+    print(f"Lines: {len(counts)}")
     print(f"Total tokens: {total}")
-    print(f"Average tokens/record: {total / len(counts):.2f}" if counts else "Average tokens/record: 0")
-    print(f"Minimum tokens/record: {min(counts) if counts else 0}")
-    print(f"Maximum tokens/record: {max(counts) if counts else 0}")
+    print(f"Average tokens/line: {total / len(counts):.2f}" if counts else "Average tokens/line: 0")
+    print(f"Minimum tokens/line: {min(counts) if counts else 0}")
+    print(f"Maximum tokens/line: {max(counts) if counts else 0}")
 
 
 def main() -> int:

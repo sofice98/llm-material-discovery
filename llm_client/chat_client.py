@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RESPONSES_URL = "https://api.minimaxi.com/v1/responses"
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429}
 _TOKEN_USAGE_LOCK = threading.Lock()
 _TOTAL_REGULAR_INPUT_TOKENS = 0
@@ -115,15 +114,11 @@ def create_client() -> ResponsesClient:
 def resolve_responses_url() -> str:
     configured = os.getenv("MODEL_URL", "").strip()
     if configured:
-        return convert_to_responses_url(configured)
+        return configured
 
-    return DEFAULT_RESPONSES_URL
-
-def convert_to_responses_url(url: str) -> str:
-    normalized = url.rstrip("/")
-    if normalized.endswith("/chat/completions"):
-        return normalized[: -len("/chat/completions")] + "/responses"
-    return normalized
+    raise LLMClientError(
+        "MODEL_URL environment variable is not set. Please create .env from .env.example."
+    )
 
 
 def is_retryable_image_url_rejection(response: requests.Response) -> bool:
