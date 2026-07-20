@@ -1,0 +1,16 @@
+{
+  "cpt": {
+    "file_name": "cpt.jsonl",
+    "columns": {
+      "prompt": "text"
+    }
+  },
+  "sft": {
+    "file_name": "sft.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  }
+}
